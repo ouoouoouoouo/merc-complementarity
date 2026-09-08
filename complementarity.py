@@ -9,9 +9,9 @@ a fusion model:
 
   Layer 2 - error-level structure.  Two pairs can share an oracle gain and
   still behave differently: one where audio rescues the utterances text gets
-  wrong, one where both fail together. Reports the 2x2 contingency, the oracle
-  ceiling any fusion method is bounded by, double-fault, disagreement, the
-  Q-statistic, and which emotions each modality rescues.
+  wrong, one where both fail together. Reports rescue/damage rates through the
+  joint probe, the oracle ceiling any fusion method is bounded by, double-fault,
+  and a per-emotion breakdown of what the joint probe fixes and breaks.
 
 Neither layer touches a fusion model, so a pair costs seconds instead of an
 hour. See README.md for the label-set and split caveats, which matter more than
@@ -25,9 +25,11 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import itertools
 import math
 import re
+import time
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
@@ -98,32 +100,77 @@ def load_npy_dir(root: Path, pool: str) -> Dict[str, np.ndarray]:
     path are ignored here — ground truth comes from the manifest, never from
     where a file happens to sit.
     """
+    files = sorted(root.rglob("*.npy"))
+    if not files:
+        raise FileNotFoundError(f"no .npy under {root}")
+    total_mb = sum(p.stat().st_size for p in files) / 1e6
+    print(f"    reading {len(files)} files ({total_mb:.0f} MB) ...", flush=True)
+
     out: Dict[str, np.ndarray] = {}
     dupes = 0
-    for p in sorted(root.rglob("*.npy")):
+    t0 = time.time()
+    for i, p in enumerate(files, 1):
         utt = p.stem
         if utt in out:
             dupes += 1
             continue
         out[utt] = _pool(np.load(p), pool)
+        if i % 1000 == 0 or i == len(files):
+            print(f"      {i}/{len(files)}  ({time.time() - t0:.0f}s)", flush=True)
     if dupes:
-        print(f"  [warn] {root}: {dupes} duplicate utt_ids, kept the first of each")
-    if not out:
-        raise FileNotFoundError(f"no .npy under {root}")
+        print(f"    [warn] {root}: {dupes} duplicate utt_ids, kept the first of each")
     return out
 
 
-def load_source(name: str, cfg: dict) -> Source:
+def _cache_key(name: str, cfg: dict) -> str:
+    """Identify a pooled source by its config plus the source files' state.
+
+    File count and newest mtime are enough to notice a re-extraction; they will
+    not notice an in-place edit that preserves both, so pass --no-cache after
+    one of those.
+    """
+    target = Path(cfg.get("path") or cfg["root"])
+    if target.is_dir():
+        files = list(target.rglob("*.npy"))
+        stamp = f"{len(files)}:{max((p.stat().st_mtime_ns for p in files), default=0)}"
+    else:
+        st = target.stat()
+        stamp = f"{st.st_size}:{st.st_mtime_ns}"
+    raw = f"{cfg['kind']}|{target}|{cfg.get('pool', 'mean_nonzero')}|{stamp}"
+    return f"{name}-{hashlib.sha1(raw.encode()).hexdigest()[:12]}.npz"
+
+
+def load_source(name: str, cfg: dict, cache_dir: Optional[Path]) -> Source:
     kind = cfg["kind"]
     pool = cfg.get("pool", "mean_nonzero")
+
+    cache_path = None
+    if cache_dir is not None:
+        cache_path = cache_dir / _cache_key(name, cfg)
+        if cache_path.exists():
+            z = np.load(cache_path, allow_pickle=False)
+            vecs = dict(zip((str(u) for u in z["utt_ids"]), z["mat"]))
+            src = Source(name=name, modality=cfg["modality"], vectors=vecs)
+            print(f"  {name:<16} {src.modality:<5} {len(vecs):>5} utts  "
+                  f"{src.dim:>5}-d  pool={pool}  (cached)")
+            return src
+
+    print(f"  {name:<16} {cfg['modality']:<5} loading, pool={pool}", flush=True)
     if kind == "pt_dict":
         vecs = load_pt_dict(Path(cfg["path"]), pool)
     elif kind == "npy_dir":
         vecs = load_npy_dir(Path(cfg["root"]), pool)
     else:
         raise ValueError(f"{name}: unknown kind {kind!r} (pt_dict | npy_dir)")
+
     src = Source(name=name, modality=cfg["modality"], vectors=vecs)
     print(f"  {name:<16} {src.modality:<5} {len(vecs):>5} utts  {src.dim:>5}-d  pool={pool}")
+    if cache_path is not None:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        utt_ids = list(vecs)
+        np.savez_compressed(cache_path, utt_ids=np.array(utt_ids),
+                            mat=np.stack([vecs[u] for u in utt_ids]))
+        print(f"    cached -> {cache_path}")
     return src
 
 
@@ -364,12 +411,16 @@ def main() -> int:
                          "any dimensionality difference is uncontrolled)")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--bootstrap", type=int, default=2000)
+    ap.add_argument("--cache", type=Path, default=Path(".cache"),
+                    help="where to keep pooled features so re-runs are instant")
+    ap.add_argument("--no-cache", action="store_true")
     args = ap.parse_args()
 
     spec = yaml.safe_load(args.spec.read_text(encoding="utf-8"))
 
     print("sources:")
-    sources = {n: load_source(n, c) for n, c in spec["features"].items()}
+    cache_dir = None if args.no_cache else args.cache
+    sources = {n: load_source(n, c, cache_dir) for n, c in spec["features"].items()}
 
     m = spec["manifest"]
     if "csv" in m:
