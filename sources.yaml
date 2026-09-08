@@ -1,0 +1,49 @@
+# Which cached features to compare, and where ground truth comes from.
+#
+# Paths below are for the cluster (/home/ouo/...). Edit for wherever you run.
+
+# Ground truth: utt_id -> (label, split). Everything is joined onto this, so a
+# feature file's own directory layout never decides a label.
+manifest:
+  # First look: derive it from the Bi-LSTM tree, whose paths already encode
+  # <split>/<emotion>/<utt_id>.npy.
+  from_npy_dir: /home/ouo/Bi-LSTM/data/iemocap/processed_paper/audio
+  split_re: '/(train|test)/'
+  label_re: '/(?:train|test)/([^/]+)/'
+
+  # Once more than one repo is involved, switch to an explicit CSV with columns
+  # utt_id,label,split — see README, the label sets do NOT match across repos.
+  # csv: manifests/iemocap_common.csv
+
+features:
+  glove:
+    kind: npy_dir
+    root: /home/ouo/Bi-LSTM/data/iemocap/processed_paper/text
+    modality: text
+    # (500, 300) GloVe sequence -> mean over real tokens. This is a bag of
+    # words: it throws away exactly what the Bi-LSTM is there to model. See the
+    # README caveat before reading anything into a GloVe row.
+    pool: mean_nonzero
+
+  handcrafted34:
+    kind: npy_dir
+    root: /home/ouo/Bi-LSTM/data/iemocap/processed_paper/audio
+    modality: audio
+    # (100, 34) frames -> mean+std functionals over real frames (68-d), the
+    # usual way handcrafted frame features are summarised per utterance.
+    pool: mean_std
+
+  # --- merits-l-* features. utt_ids have to reconcile with the manifest first;
+  # the script tells you how many matched, and refuses to guess. ---
+  # llama_stage1:
+  #   kind: pt_dict
+  #   path: /home/ouo/merits-l-llama/data/cache/iemocap_llama_features.pt
+  #   modality: text
+  # roberta_stage1:
+  #   kind: pt_dict
+  #   path: /home/ouo/merits-l-text/data/cache/iemocap_roberta_features.pt
+  #   modality: text
+  # care:
+  #   kind: pt_dict
+  #   path: /home/ouo/merits-l-llama/data/cache/iemocap_audio_stage2_utt.pt
+  #   modality: audio
