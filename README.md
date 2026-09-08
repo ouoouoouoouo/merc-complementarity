@@ -101,6 +101,17 @@ information" can be pure dimensionality. `--dim` PCAs both sides to a common
 size (default 128, fit on train only). `--dim 0` turns that off, and then the
 comparison across pairs is not controlled — the header says so when you do.
 
+**`realzd` gets unstable when `headrm` is small.** It is a ratio, so a pair
+whose unimodal probes are already close to the ceiling divides a small number
+by a small number. Read it next to `headrm`, and treat a large `realzd` with a
+tiny `headrm` as noise rather than a finding.
+
+**Two sources of variance, and the CI only covers one.** The bootstrap CI
+covers test-set sampling. It does not cover probe training — for the MLP, its
+initialisation and its own early-stopping split. `--seeds N` repeats every pair
+with seeds 0..N-1 and reports the spread of the gain, which is often the larger
+of the two. A single-seed number is one draw; report the spread.
+
 **One split is not evidence.** IEMOCAP test splits are ~1.2k utterances and
 speaker-dependent effects are large. A 1-2 pp difference between pairs is
 inside the noise. Treat a single run as a screen, and confirm anything you

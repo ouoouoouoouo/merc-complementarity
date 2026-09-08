@@ -308,6 +308,8 @@ def exact_mcnemar(b: int, c: int) -> float:
 
 
 def bootstrap_ci(fn, *arrays, n: int = 2000, seed: int = 0, alpha: float = 0.05):
+    if n <= 0:                      # caller only wants the point estimate
+        return float("nan"), float("nan")
     rng = np.random.default_rng(seed)
     m = len(arrays[0])
     vals = np.empty(n)
@@ -440,6 +442,12 @@ def main() -> int:
                     help="PCA both modalities to this dim (0 = off, and then "
                          "any dimensionality difference is uncontrolled)")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--seeds", type=int, default=1,
+                    help="repeat every pair with seeds 0..N-1 and report the "
+                         "spread of the gain. The bootstrap CI covers test-set "
+                         "sampling only; this covers probe training, which for "
+                         "the MLP (init + its own early-stopping split) is a "
+                         "separate and often larger source of variation")
     ap.add_argument("--bootstrap", type=int, default=2000)
     ap.add_argument("--cache", type=Path, default=Path(".cache"),
                     help="where to keep pooled features so re-runs are instant")
@@ -474,10 +482,20 @@ def main() -> int:
         return 1
 
     rows = []
+    spreads = []
     for t, a in pairs:
         man_p, mats = align(man, [t, a])
         rows.append(evaluate_pair(t, a, man_p, mats, args.probe,
                                   args.dim or None, args.seed, args.bootstrap))
+        if args.seeds > 1:
+            # Bootstrap is off for the extra seeds; it answers a different
+            # question and would multiply the runtime for nothing.
+            reps = [rows[-1]] + [
+                evaluate_pair(t, a, man_p, mats, args.probe, args.dim or None,
+                              sd, 0)
+                for sd in range(args.seeds) if sd != args.seed
+            ]
+            spreads.append((t.name, a.name, reps))
 
     dim_note = f"PCA->{args.dim}" if args.dim else "raw dims, UNCONTROLLED"
     print(f"\n=== Layer 1: oracle gain ({args.probe} probe, {dim_note}, "
@@ -522,6 +540,24 @@ def main() -> int:
           "information still disagree wherever each guesses the part neither can "
           "see, so a low Q is not evidence of complementarity. Read rescue/damage "
           "instead, and Q only alongside them.")
+
+    if spreads:
+        print(f"\n=== Seed stability ({args.seeds} seeds, probe training only) ===")
+        head3 = (f"{'text':<14} {'audio':<14} {'gain mean ± std':>18} "
+                 f"{'realzd mean ± std':>20}   per-seed gain")
+        print(head3)
+        print("-" * len(head3))
+        for tname, aname, reps in spreads:
+            g = np.array([r["gain"] for r in reps])
+            z = np.array([r["realized"] for r in reps])
+            gs = g.std(ddof=1) if len(g) > 1 else 0.0
+            zs = z.std(ddof=1) if len(z) > 1 else 0.0
+            per = " ".join(f"{v:+.4f}" for v in g)
+            print(f"{tname:<14} {aname:<14} {g.mean():>+9.4f} ± {gs:.4f} "
+                  f"{z.mean():>11.4f} ± {zs:.4f}   {per}")
+        print("\nIf this std is comparable to the gain itself, a single-seed number "
+              "means nothing and the tables above are one draw from it. Report the "
+              "spread, not the draw.")
 
     print("\n=== Per emotion: what the joint probe fixes and breaks ===")
     for r in rows:
