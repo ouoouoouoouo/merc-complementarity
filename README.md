@@ -35,7 +35,9 @@ complementarity. Two pairs with the same gain can differ completely:
 |---|---|
 | `rescue` | of the utterances the better single modality gets **wrong**, the fraction the joint probe recovers |
 | `damage` | of those it gets **right**, the fraction the joint probe loses |
-| `ceiling` | fraction at least one modality gets right — a bound on *any* fusion method |
+| `headrm` | `ceiling - accuracy of the better single modality`: the room that exists |
+| `realzd` | fraction of that room the joint probe actually took — **the number to compare across pairs** |
+| `ceiling` | fraction at least one modality gets right — bounds *decision-level* fusion only |
 | `2fault` | both wrong; fusion cannot reach these at all |
 | `Q` | Kuncheva & Whitaker Q-statistic over the two correctness vectors |
 
@@ -43,7 +45,18 @@ Plus a per-emotion breakdown of what the joint probe fixes and breaks — often
 the most informative output, e.g. audio recovering *angry* while costing
 *neutral*.
 
-**`rescue` and `damage` are the ones to read.** They route through the joint
+**Compare pairs on `realzd`, not on raw gain.** A pair whose unimodal probes
+are weak has far more room to improve, so absolute gain rewards weak features.
+`realzd` divides by the room that exists.
+
+**`realzd > 1` is a finding, not a bug.** `ceiling` bounds decision-level
+fusion — any rule that picks or weights the two predictions. Feature-level
+concatenation sees the representations themselves and can be right where both
+unimodal probes were wrong. Exceeding the ceiling means the pair carries
+synergy: information present only in the two together, which no decision-level
+combiner can reach.
+
+**`rescue` and `damage` are the ones to read alongside it.** They route through the joint
 probe, so they measure information that actually combines. `rescue` high with
 `damage` near zero is real complementarity; the two roughly equal is a pair
 that reshuffles errors without adding anything.
@@ -63,8 +76,12 @@ fully complementary one — useless — while rescue/damage separate them cleanl
 sad}` — `exc` is its own class and `hap` is dropped entirely. merits-l-text and
 merits-l-llama use `{angry, happy, sad, neutral}` with `hap` and `exc` merged
 into happy. These are different 4-class problems and their numbers are not
-comparable. Before comparing features across repos, build one common manifest
-(`utt_id,label,split`) and point every source at it.
+comparable. `build_manifest.py` resolves this by taking the merits convention
+as canonical and emitting one `utt_id,label,split` CSV that every source is
+joined onto. The `hap` utterances it asks for have no Bi-LSTM features at all —
+`preprocess.py` skipped them — so `Bi-LSTM/extract_for_manifest.py` extracts
+just those into a flat top-up tree, which is listed as a second `roots` entry
+beside the original.
 
 **The splits do not match either.** Bi-LSTM trains on Sessions 1-4 and tests on
 Session 5. The merits manifests use their own train/val/test. Same fix: one
@@ -91,6 +108,12 @@ would put in a table with leave-one-session-out.
 
 ## Workflow
 
+0. Build the shared manifest, then top up whatever features it is missing:
+
+   ```bash
+   python build_manifest.py --merits-manifests ~/merits-l-llama/data/manifests/iemocap        --out manifests/iemocap_common.csv        --check-npy ~/Bi-LSTM/data/iemocap/processed_paper/audio
+   ```
+
 1. Run every pair with the linear probe to see whether the gains spread at all.
    If every pair lands within ~1 pp, there is no story here and it is worth
    knowing that on day one.
@@ -105,9 +128,10 @@ would put in a table with leave-one-session-out.
 See `sources.yaml`. Each entry is a feature source:
 
 - `kind: pt_dict` — a `{utt_id: tensor}` `.pt` (the merits-l-* convention)
-- `kind: npy_dir` — a tree of `<utt_id>.npy`, indexed by filename stem; the
-  split/label directories in the path are ignored, because ground truth comes
-  from the manifest
+- `kind: npy_dir` — a tree of `<utt_id>.npy` under `root`, or several trees
+  under `roots` (earlier ones win), indexed by filename stem; the split/label
+  directories in the path are ignored, because ground truth comes from the
+  manifest
 - `pool` — for 2-D `(T, D)` features: `mean_nonzero` (default, ignores
   zero-padding), `mean`, `max`, or `mean_std` (mean+std functionals). 1-D
   features pass through untouched.

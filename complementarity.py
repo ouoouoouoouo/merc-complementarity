@@ -10,8 +10,9 @@ a fusion model:
   Layer 2 - error-level structure.  Two pairs can share an oracle gain and
   still behave differently: one where audio rescues the utterances text gets
   wrong, one where both fail together. Reports rescue/damage rates through the
-  joint probe, the oracle ceiling any fusion method is bounded by, double-fault,
-  and a per-emotion breakdown of what the joint probe fixes and breaks.
+  joint probe, the ceiling that bounds decision-level fusion, how much of the
+  available headroom was realized, and a per-emotion breakdown of what the
+  joint probe fixes and breaks.
 
 Neither layer touches a fusion model, so a pair costs seconds instead of an
 hour. See README.md for the label-set and split caveats, which matter more than
@@ -93,16 +94,17 @@ def load_pt_dict(path: Path, pool: str) -> Dict[str, np.ndarray]:
     return {str(k): _pool(np.asarray(v, dtype=np.float64), pool) for k, v in obj.items()}
 
 
-def load_npy_dir(root: Path, pool: str) -> Dict[str, np.ndarray]:
-    """A tree of <utt_id>.npy, e.g. Bi-LSTM's <split>/<emotion>/<utt_id>.npy.
+def load_npy_dir(roots: List[Path], pool: str) -> Dict[str, np.ndarray]:
+    """Trees of <utt_id>.npy, e.g. Bi-LSTM's <split>/<emotion>/<utt_id>.npy.
 
-    The tree is indexed by file stem, so the split/label directories in the
-    path are ignored here — ground truth comes from the manifest, never from
-    where a file happens to sit.
+    Indexed by file stem, so the split/label directories in the path are
+    ignored — ground truth comes from the manifest, never from where a feature
+    file happens to sit. Several roots can be given (earlier ones win), so a
+    top-up extraction lives beside the original tree instead of duplicating it.
     """
-    files = sorted(root.rglob("*.npy"))
+    files = [p for r in roots for p in sorted(r.rglob("*.npy"))]
     if not files:
-        raise FileNotFoundError(f"no .npy under {root}")
+        raise FileNotFoundError(f"no .npy under {', '.join(str(r) for r in roots)}")
     total_mb = sum(p.stat().st_size for p in files) / 1e6
     print(f"    reading {len(files)} files ({total_mb:.0f} MB) ...", flush=True)
 
@@ -118,8 +120,14 @@ def load_npy_dir(root: Path, pool: str) -> Dict[str, np.ndarray]:
         if i % 1000 == 0 or i == len(files):
             print(f"      {i}/{len(files)}  ({time.time() - t0:.0f}s)", flush=True)
     if dupes:
-        print(f"    [warn] {root}: {dupes} duplicate utt_ids, kept the first of each")
+        print(f"    [warn] {dupes} duplicate utt_ids across roots, kept the first")
     return out
+
+
+def _roots_of(cfg: dict) -> List[Path]:
+    if "roots" in cfg:
+        return [Path(r) for r in cfg["roots"]]
+    return [Path(cfg["root"])]
 
 
 def _cache_key(name: str, cfg: dict) -> str:
@@ -129,14 +137,16 @@ def _cache_key(name: str, cfg: dict) -> str:
     not notice an in-place edit that preserves both, so pass --no-cache after
     one of those.
     """
-    target = Path(cfg.get("path") or cfg["root"])
-    if target.is_dir():
-        files = list(target.rglob("*.npy"))
-        stamp = f"{len(files)}:{max((p.stat().st_mtime_ns for p in files), default=0)}"
-    else:
+    if cfg["kind"] == "pt_dict":
+        target = Path(cfg["path"])
         st = target.stat()
-        stamp = f"{st.st_size}:{st.st_mtime_ns}"
-    raw = f"{cfg['kind']}|{target}|{cfg.get('pool', 'mean_nonzero')}|{stamp}"
+        targets, stamp = str(target), f"{st.st_size}:{st.st_mtime_ns}"
+    else:
+        roots = _roots_of(cfg)
+        files = [p for r in roots for p in r.rglob("*.npy")]
+        targets = "+".join(str(r) for r in roots)
+        stamp = f"{len(files)}:{max((p.stat().st_mtime_ns for p in files), default=0)}"
+    raw = f"{cfg['kind']}|{targets}|{cfg.get('pool', 'mean_nonzero')}|{stamp}"
     return f"{name}-{hashlib.sha1(raw.encode()).hexdigest()[:12]}.npz"
 
 
@@ -159,7 +169,7 @@ def load_source(name: str, cfg: dict, cache_dir: Optional[Path]) -> Source:
     if kind == "pt_dict":
         vecs = load_pt_dict(Path(cfg["path"]), pool)
     elif kind == "npy_dir":
-        vecs = load_npy_dir(Path(cfg["root"]), pool)
+        vecs = load_npy_dir(_roots_of(cfg), pool)
     else:
         raise ValueError(f"{name}: unknown kind {kind!r} (pt_dict | npy_dir)")
 
@@ -325,6 +335,24 @@ def error_structure(y: np.ndarray, pt: np.ndarray, pa: np.ndarray, pc: np.ndarra
     denom = both * neither + only_t * only_a
     q = ((both * neither - only_t * only_a) / denom) if denom else float("nan")
 
+    # Fraction at least one modality gets right. This bounds DECISION-level
+    # fusion — any rule that picks or weights the two predictions — but NOT
+    # feature-level fusion, which sees the representations and can be right
+    # where both unimodal probes were wrong.
+    ceiling = (N - neither) / N
+    # Absolute gain is not comparable across pairs: a pair whose unimodal
+    # probes are weak has far more room to gain. Normalise by the room that
+    # actually exists. Accuracy throughout, so numerator and denominator are
+    # the same kind of number (the Layer 1 gain is weighted F1, deliberately —
+    # that is the thesis metric — but it must not be divided by an accuracy).
+    # realized > 1 is therefore not an error: it means the joint probe beat
+    # every possible decision-level combiner, which is a positive finding of
+    # synergy — information carried only by the two together.
+    acc_best_uni = max(float(np.mean(t_ok)), float(np.mean(a_ok)))
+    headroom = ceiling - acc_best_uni
+    realized = ((float(np.mean(c_ok)) - acc_best_uni) / headroom
+                if headroom > 1e-9 else float("nan"))
+
     n_uni_wrong = int(np.sum(~u_ok))
     n_uni_right = int(np.sum(u_ok))
     rescue = float(np.sum(~u_ok & c_ok) / n_uni_wrong) if n_uni_wrong else float("nan")
@@ -332,7 +360,9 @@ def error_structure(y: np.ndarray, pt: np.ndarray, pa: np.ndarray, pc: np.ndarra
 
     return {
         "both": both, "only_text": only_t, "only_audio": only_a, "neither": neither,
-        "oracle_ceiling": (N - neither) / N,
+        "oracle_ceiling": ceiling,
+        "headroom": headroom,
+        "realized": realized,
         "double_fault": neither / N,
         "disagreement": (only_t + only_a) / N,
         "q_statistic": q,
@@ -466,21 +496,29 @@ def main() -> int:
 
     print(f"\n=== Layer 2: error structure (n_test={rows[0]['n_test']}) ===")
     head2 = (f"{'text':<14} {'audio':<14} {'both':>6} {'onlyT':>6} {'onlyA':>6} "
-             f"{'none':>6} {'ceiling':>8} {'2fault':>7} {'rescue':>7} {'damage':>7} "
-             f"{'Q':>7}")
+             f"{'none':>6} {'ceiling':>8} {'headrm':>7} {'realzd':>7} {'rescue':>7} "
+             f"{'damage':>7} {'Q':>7}")
     print(head2)
     print("-" * len(head2))
     for r in rows:
         print(f"{r['text']:<14} {r['audio']:<14} {r['both']:>6} {r['only_text']:>6} "
               f"{r['only_audio']:>6} {r['neither']:>6} {r['oracle_ceiling']:>8.4f} "
-              f"{r['double_fault']:>7.4f} {r['rescue_rate']:>7.4f} "
+              f"{r['headroom']:>7.4f} {r['realized']:>7.4f} {r['rescue_rate']:>7.4f} "
               f"{r['damage_rate']:>7.4f} {r['q_statistic']:>7.3f}")
-    print("\nrescue = of the utterances the better single modality gets wrong, the "
+    print("\nrealzd = (joint probe accuracy - better single modality accuracy) / "
+          "headrm, where headrm = ceiling - that same accuracy. THIS is the "
+          "number to compare across pairs: raw gain rewards a pair whose "
+          "unimodal probes are weak, simply because it has more room.")
+    print("rescue = of the utterances the better single modality gets wrong, the "
           "fraction the joint probe recovers; damage = of those it gets right, the "
           "fraction the joint probe loses. These two route through the joint probe, "
           "so they measure combinable information.")
-    print("ceiling = fraction at least one modality gets right, a bound on any "
-          "fusion. Q is prediction diversity ONLY: two probes carrying identical "
+    print("ceiling = fraction at least one modality gets right. It bounds "
+          "DECISION-level fusion (any rule over the two predictions), not "
+          "feature-level fusion, so realzd > 1 is a real signal, not a bug: the "
+          "joint probe beat every possible decision-level combiner, meaning the "
+          "pair carries synergy that lives only in the two together.")
+    print("Q is prediction diversity ONLY: two probes carrying identical "
           "information still disagree wherever each guesses the part neither can "
           "see, so a low Q is not evidence of complementarity. Read rescue/damage "
           "instead, and Q only alongside them.")
